@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'dart:convert';
+import 'dart:io';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:permission_handler/permission_handler.dart';
 
 class Message {
   final String id;
@@ -9,6 +13,7 @@ class Message {
   final DateTime timestamp;
   final String type; // 'text' or 'image'
   final String? imageUrl;
+  final File? imageFile; // 로컬 이미지 파일
 
   Message({
     required this.id,
@@ -17,6 +22,7 @@ class Message {
     required this.timestamp,
     required this.type,
     this.imageUrl,
+    this.imageFile,
   });
 }
 
@@ -62,27 +68,254 @@ class _MainChatState extends State<MainChat> {
   bool _isVoiceMode = false;
   bool _isRecording = false;
   bool _showImageUpload = false;
-  bool _isLoading = false; // API 호출 중 로딩 상태
+  bool _isLoading = false;
+  
+  // 이미지 선택기
+  final ImagePicker _picker = ImagePicker();
+  
+  // 음성 인식
+  late stt.SpeechToText _speech;
+  bool _speechAvailable = false;
+  String _recognizedText = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _initSpeech();
+  }
+
+  // 음성 인식 초기화
+  Future<void> _initSpeech() async {
+    _speech = stt.SpeechToText();
+    bool available = await _speech.initialize(
+      onStatus: (status) {
+        if (status == 'done' || status == 'notListening') {
+          setState(() {
+            _isRecording = false;
+          });
+        }
+      },
+      onError: (error) {
+        print('Speech error: $error');
+        setState(() {
+          _isRecording = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('음성 인식 오류: $error')),
+        );
+      },
+    );
+    
+    setState(() {
+      _speechAvailable = available;
+    });
+  }
+
+  // 음성 녹음 시작
+  Future<void> _startListening() async {
+    // 마이크 권한 확인
+    var status = await Permission.microphone.request();
+    if (!status.isGranted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('마이크 권한이 필요합니다')),
+      );
+      return;
+    }
+
+    if (!_speechAvailable) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('음성 인식을 사용할 수 없습니다')),
+      );
+      return;
+    }
+
+    setState(() {
+      _recognizedText = '';
+      _isRecording = true;
+    });
+
+    await _speech.listen(
+      onResult: (result) {
+        setState(() {
+          _recognizedText = result.recognizedWords;
+          _textController.text = _recognizedText;
+        });
+      },
+      localeId: 'ko_KR', // 한국어 설정
+    );
+  }
+
+  // 음성 녹음 중지
+  Future<void> _stopListening() async {
+    await _speech.stop();
+    setState(() {
+      _isRecording = false;
+    });
+  }
 
   @override
   void dispose() {
     _textController.dispose();
     _scrollController.dispose();
+    _speech.cancel();
     super.dispose();
   }
 
-  // API 호출: 대화 이어가기
-  Future<String> _callContinueChat(String userMessage) async {
+  // 이미지 선택 (갤러리 또는 카메라)
+  Future<void> _pickImage(ImageSource source) async {
     try {
+      // 권한 확인
+      if (source == ImageSource.camera) {
+        var status = await Permission.camera.request();
+        if (!status.isGranted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('카메라 권한이 필요합니다')),
+          );
+          return;
+        }
+      } else {
+        var status = await Permission.photos.request();
+        if (!status.isGranted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('사진 접근 권한이 필요합니다')),
+          );
+          return;
+        }
+      }
+
+      final XFile? image = await _picker.pickImage(
+        source: source,
+        maxWidth: 1024,
+        maxHeight: 1024,
+        imageQuality: 85,
+      );
+      
+      if (image != null) {
+        File imageFile = File(image.path);
+        _handleImageUpload(imageFile);
+      }
+    } catch (e) {
+      print('Image pick error: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('이미지를 선택할 수 없습니다: $e')),
+      );
+    }
+  }
+
+  // 이미지 선택 다이얼로그 (화면 중앙)
+  void _showImageSourceDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '사진 선택',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.grey[800],
+                ),
+              ),
+              const SizedBox(height: 20),
+              // 갤러리 버튼
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    _pickImage(ImageSource.gallery);
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue[500],
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  icon: const Icon(Icons.photo_library, color: Colors.white),
+                  label: const Text(
+                    '갤러리에서 선택',
+                    style: TextStyle(fontSize: 16, color: Colors.white),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              // 카메라 버튼
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    _pickImage(ImageSource.camera);
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green[500],
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  icon: const Icon(Icons.camera_alt, color: Colors.white),
+                  label: const Text(
+                    '카메라로 촬영',
+                    style: TextStyle(fontSize: 16, color: Colors.white),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              // 취소 버튼
+              SizedBox(
+                width: double.infinity,
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                  child: Text(
+                    '취소',
+                    style: TextStyle(fontSize: 16, color: Colors.grey[600]),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // 이미지를 base64로 인코딩
+  Future<String> _encodeImageToBase64(File imageFile) async {
+    List<int> imageBytes = await imageFile.readAsBytes();
+    return base64Encode(imageBytes);
+  }
+
+  // API 호출: 대화 이어가기
+  Future<String> _callContinueChat(String userMessage, {String? imageBase64}) async {
+    try {
+      Map<String, dynamic> requestBody = {
+        'user_message': userMessage,
+        'chat_history': _chatHistory,
+        'model': 'gpt-4o-mini',
+        'temperature': 0.7,
+      };
+
+      // 이미지가 있으면 추가
+      if (imageBase64 != null) {
+        requestBody['image'] = imageBase64;
+      }
+
       final response = await http.post(
         Uri.parse(CONTINUE_ENDPOINT),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'user_message': userMessage,
-          'chat_history': _chatHistory,
-          'model': 'gpt-4o-mini',
-          'temperature': 0.7,
-        }),
+        body: jsonEncode(requestBody),
       );
 
       if (response.statusCode == 200) {
@@ -98,112 +331,108 @@ class _MainChatState extends State<MainChat> {
     }
   }
 
-// API 호출: 감정 분석
-Future<Map<String, dynamic>> _callEmotionAnalysis() async {
-  try {
-    final response = await http.post(
-      Uri.parse(ANALYZE_ENDPOINT),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'chat_history': _chatHistory,
-      }),
-    );
+  // API 호출: 감정 분석
+  Future<Map<String, dynamic>> _callEmotionAnalysis() async {
+    try {
+      final response = await http.post(
+        Uri.parse(ANALYZE_ENDPOINT),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'chat_history': _chatHistory,
+        }),
+      );
 
-    if (response.statusCode == 200) {
-      final data = jsonDecode(utf8.decode(response.bodyBytes));
-      
-      var emotionResult = data['emotion_result'];
-      
-      // 👇 여기부터 수정!
-      
-      // 1단계: 문자열이면 파싱
-      if (emotionResult is String) {
-        emotionResult = emotionResult
-            .replaceAll('```json', '')
-            .replaceAll('```', '')
-            .trim();
+      if (response.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
         
-        try {
-          emotionResult = jsonDecode(emotionResult);
-        } catch (e) {
-          print('JSON 파싱 실패: $e');
-          return _getMockAnalysisData();
-        }
-      }
-
-      // 2단계: Map이 아니면 에러
-      if (emotionResult is! Map) {
-        print('emotionResult가 Map이 아닙니다: $emotionResult');
-        return _getMockAnalysisData();
-      }
-
-      // 🔥 3단계: raw_text 키가 있으면 한번 더 파싱!
-      if (emotionResult.containsKey('raw_text')) {
-        var rawText = emotionResult['raw_text'];
+        var emotionResult = data['emotion_result'];
         
-        if (rawText is String) {
-          rawText = rawText
+        // 1단계: 문자열이면 파싱
+        if (emotionResult is String) {
+          emotionResult = emotionResult
               .replaceAll('```json', '')
               .replaceAll('```', '')
               .trim();
           
           try {
-            emotionResult = jsonDecode(rawText);
+            emotionResult = jsonDecode(emotionResult);
           } catch (e) {
-            print('raw_text JSON 파싱 실패: $e');
+            print('JSON 파싱 실패: $e');
             return _getMockAnalysisData();
           }
         }
-      }
 
-      // 4단계: 다시 한번 Map 확인
-      if (emotionResult is! Map) {
-        print('최종 emotionResult가 Map이 아닙니다: $emotionResult');
-        return _getMockAnalysisData();
-      }
+        // 2단계: Map이 아니면 에러
+        if (emotionResult is! Map) {
+          print('emotionResult가 Map이 아닙니다: $emotionResult');
+          return _getMockAnalysisData();
+        }
 
-      // 5단계: 모든 값을 int로 변환
-      final Map<String, dynamic> emotions = {};
-      emotionResult.forEach((key, value) {
-        // raw_text 같은 이상한 키는 제외
-        if (key == 'raw_text') return;
-        
-        if (value is int) {
-          emotions[key] = value;
-        } else if (value is double) {
-          emotions[key] = value.toInt();
-        } else if (value is String) {
-          try {
-            emotions[key] = int.parse(value);
-          } catch (e) {
+        // 3단계: raw_text 키가 있으면 한번 더 파싱!
+        if (emotionResult.containsKey('raw_text')) {
+          var rawText = emotionResult['raw_text'];
+          
+          if (rawText is String) {
+            rawText = rawText
+                .replaceAll('```json', '')
+                .replaceAll('```', '')
+                .trim();
+            
+            try {
+              emotionResult = jsonDecode(rawText);
+            } catch (e) {
+              print('raw_text JSON 파싱 실패: $e');
+              return _getMockAnalysisData();
+            }
+          }
+        }
+
+        // 4단계: 다시 한번 Map 확인
+        if (emotionResult is! Map) {
+          print('최종 emotionResult가 Map이 아닙니다: $emotionResult');
+          return _getMockAnalysisData();
+        }
+
+        // 5단계: 모든 값을 int로 변환
+        final Map<String, dynamic> emotions = {};
+        emotionResult.forEach((key, value) {
+          if (key == 'raw_text') return;
+          
+          if (value is int) {
+            emotions[key] = value;
+          } else if (value is double) {
+            emotions[key] = value.toInt();
+          } else if (value is String) {
+            try {
+              emotions[key] = int.parse(value);
+            } catch (e) {
+              emotions[key] = 0;
+            }
+          } else {
             emotions[key] = 0;
           }
-        } else {
-          emotions[key] = 0;
-        }
-      });
+        });
 
-      // 감정 데이터가 비어있으면 Mock 데이터
-      if (emotions.isEmpty) {
-        print('감정 데이터가 비어있습니다');
+        if (emotions.isEmpty) {
+          print('감정 데이터가 비어있습니다');
+          return _getMockAnalysisData();
+        }
+
+        return {
+          'emotions': emotions,
+          'summary': '오늘 상담에서는 다양한 감정을 표현하셨습니다.',
+          'recommendations': '규칙적인 운동과 충분한 휴식을 권장드리며, 가족이나 친구들과의 소통을 늘려보시기 바랍니다.',
+          'messages': _messages,
+        };
+      } else {
+        print('Emotion API Error: ${response.statusCode}');
         return _getMockAnalysisData();
       }
-
-      return {
-        'emotions': emotions,
-        'summary': '오늘 상담에서는 다양한 감정을 표현하셨습니다.',
-        'recommendations': '규칙적인 운동과 충분한 휴식을 권장드리며, 가족이나 친구들과의 소통을 늘려보시기 바랍니다.',
-        'messages': _messages,
-      };
-    } else {
-      print('Emotion API Error: ${response.statusCode}');
+    } catch (e) {
+      print('Emotion Analysis Error: $e');
       return _getMockAnalysisData();
     }
-  } catch (e) {
-    print('Emotion Analysis Error: $e');
-    return _getMockAnalysisData();
   }
-}
 
   // 백업용 Mock 데이터
   Map<String, dynamic> _getMockAnalysisData() {
@@ -281,39 +510,77 @@ Future<Map<String, dynamic>> _callEmotionAnalysis() async {
     });
   }
 
-  void _handleImageUpload(String imageUrl) {
+  void _handleImageUpload(File imageFile) async {
+    setState(() {
+      _showImageUpload = false;
+      _isLoading = true;
+    });
+
+    // 이미지 메시지 추가
     final imageMessage = Message(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: '사진을 업로드했습니다.',
       sender: 'user',
       timestamp: DateTime.now(),
       type: 'image',
-      imageUrl: imageUrl,
+      imageFile: imageFile,
     );
 
     setState(() {
       _messages.add(imageMessage);
-      _showImageUpload = false;
     });
 
-    // AI 응답
-    Future.delayed(const Duration(milliseconds: 1500), () {
-      final aiResponse = Message(
-        id: (DateTime.now().millisecondsSinceEpoch + 1).toString(),
-        text: '사진을 잘 보았습니다. 이 사진과 관련해서 어떤 이야기를 나누고 싶으신가요?',
-        sender: 'ai',
-        timestamp: DateTime.now(),
-        type: 'text',
+    // 스크롤 아래로
+    Future.delayed(const Duration(milliseconds: 100), () {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
       );
+    });
 
-      setState(() {
-        _messages.add(aiResponse);
-      });
+    // 이미지를 base64로 인코딩
+    String imageBase64 = await _encodeImageToBase64(imageFile);
+
+    // chat_history에 이미지 메시지 추가
+    _chatHistory.add({
+      'role': 'user',
+      'content': '사진을 공유했습니다.',
+    });
+
+    // API 호출 (이미지 포함)
+    final aiReply = await _callContinueChat(
+      '사진을 보았습니다. 이 사진과 관련해서 어떤 이야기를 나누고 싶으신가요?',
+      imageBase64: imageBase64,
+    );
+
+    // AI 응답 추가
+    final aiResponse = Message(
+      id: (DateTime.now().millisecondsSinceEpoch + 1).toString(),
+      text: aiReply,
+      sender: 'ai',
+      timestamp: DateTime.now(),
+      type: 'text',
+    );
+
+    _chatHistory.add({'role': 'assistant', 'content': aiReply});
+
+    setState(() {
+      _messages.add(aiResponse);
+      _isLoading = false;
+    });
+
+    Future.delayed(const Duration(milliseconds: 100), () {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
     });
   }
 
   void _handleEndConsultation() async {
-    // 로딩 표시
+    // 로딩 표시 (화면 정중앙)
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -366,17 +633,17 @@ Future<Map<String, dynamic>> _callEmotionAnalysis() async {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (message.type == 'image' && message.imageUrl != null)
+                  if (message.type == 'image' && message.imageFile != null)
                     ClipRRect(
                       borderRadius: BorderRadius.circular(12),
-                      child: Image.network(
-                        message.imageUrl!,
+                      child: Image.file(
+                        message.imageFile!,
                         width: double.infinity,
-                        height: 160,
+                        height: 200,
                         fit: BoxFit.cover,
                       ),
                     ),
-                  if (message.type == 'image' && message.imageUrl != null)
+                  if (message.type == 'image' && message.imageFile != null)
                     const SizedBox(height: 12),
                   Text(
                     message.text,
@@ -409,12 +676,13 @@ Future<Map<String, dynamic>> _callEmotionAnalysis() async {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.white,
+      resizeToAvoidBottomInset: true, // 키보드 대응
       body: SafeArea(
         child: Column(
           children: [
             // 헤더
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
               child: Column(
                 children: [
                   Text(
@@ -473,292 +741,189 @@ Future<Map<String, dynamic>> _callEmotionAnalysis() async {
               ),
             ),
 
-            // 음성 모드 컨트롤
-            if (_isVoiceMode)
-              Padding(
-                padding: const EdgeInsets.all(24),
-                child: Card(
-                  elevation: 2,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Column(
-                      children: [
-                        Text(
-                          _isRecording ? '녹음 중입니다...' : '음성 상담 준비',
-                          style: TextStyle(
-                            color: Colors.grey[800],
-                            fontSize: 16,
-                          ),
-                        ),
-                        const SizedBox(height: 24),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            ElevatedButton(
-                              onPressed: () {
-                                setState(() {
-                                  _isRecording = !_isRecording;
-                                });
-                              },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor:
-                                    _isRecording ? Colors.red[500] : Colors.blue[500],
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 32,
-                                  vertical: 20,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                              ),
-                              child: Text(
-                                _isRecording ? '일시정지' : '시작',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 16,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 16),
-                            ElevatedButton(
-                              onPressed: () {
-                                setState(() {
-                                  _isVoiceMode = false;
-                                });
-                              },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.grey[500],
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 32,
-                                  vertical: 20,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                              ),
-                              child: const Text(
-                                '종료',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 16,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
+            // 음성 녹음 중 표시
+            if (_isRecording)
+              Container(
+                padding: const EdgeInsets.all(16),
+                margin: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.red[50],
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.red[200]!),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 12,
+                      height: 12,
+                      decoration: BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
                     ),
-                  ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _recognizedText.isEmpty ? '듣고 있습니다...' : _recognizedText,
+                        style: TextStyle(
+                          color: Colors.grey[800],
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
 
-            // 이미지 업로드
-            if (_showImageUpload)
-              Padding(
-                padding: const EdgeInsets.all(24),
-                child: Card(
-                  elevation: 2,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
+            // 하단 컨트롤 영역 (3/4 크기)
+            Container(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.grey.withOpacity(0.1),
+                    spreadRadius: 1,
+                    blurRadius: 4,
+                    offset: const Offset(0, -2),
                   ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Column(
-                      children: [
-                        const Text('이미지 업로드 기능'),
-                        const SizedBox(height: 16),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            ElevatedButton(
-                              onPressed: () {
-                                // 실제 구현에서는 image_picker 패키지 사용
-                                _handleImageUpload('https://example.com/image.jpg');
-                              },
-                              child: const Text('이미지 선택'),
-                            ),
-                            const SizedBox(width: 16),
-                            TextButton(
-                              onPressed: () {
-                                setState(() {
-                                  _showImageUpload = false;
-                                });
-                              },
-                              child: const Text('취소'),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
+                ],
               ),
-
-            // 하단 컨트롤 영역
-            Padding(
-              padding: const EdgeInsets.all(24),
               child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  // 사진 업로드 버튼
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: () {
-                        setState(() {
-                          _showImageUpload = !_showImageUpload;
-                        });
-                      },
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green[500],
-                        padding: const EdgeInsets.symmetric(vertical: 20),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      child: const Text(
-                        '사진 올리기',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-
-                  // 상담 종료 버튼
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: _isLoading ? null : _handleEndConsultation,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blue[600],
-                        padding: const EdgeInsets.symmetric(vertical: 20),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      child: const Text(
-                        '상담종료',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-
-                  // 입력 모드 선택
+                  // 사진 업로드 & 상담 종료 버튼 (3/4 크기)
                   Row(
                     children: [
                       Expanded(
                         child: ElevatedButton(
-                          onPressed: () {
-                            setState(() {
-                              _isVoiceMode = true;
-                            });
-                          },
+                          onPressed: _isLoading ? null : _showImageSourceDialog,
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: _isVoiceMode
-                                ? Colors.blue[600]
-                                : Colors.grey[100],
-                            foregroundColor: _isVoiceMode
-                                ? Colors.white
-                                : Colors.grey[700],
-                            padding: const EdgeInsets.symmetric(vertical: 20),
+                            backgroundColor: Colors.green[500],
+                            padding: const EdgeInsets.symmetric(vertical: 8),
                             shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
+                              borderRadius: BorderRadius.circular(10),
                             ),
                           ),
-                          child: const Text(
-                            '음성 상담',
-                            style: TextStyle(fontSize: 16),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: const [
+                              Icon(Icons.photo_camera, color: Colors.white, size: 16),
+                              SizedBox(width: 4),
+                              Text(
+                                '사진',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
-                      const SizedBox(width: 12),
+                      const SizedBox(width: 6),
                       Expanded(
                         child: ElevatedButton(
-                          onPressed: () {
-                            setState(() {
-                              _isVoiceMode = false;
-                            });
-                          },
+                          onPressed: _isLoading ? null : _handleEndConsultation,
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: !_isVoiceMode
-                                ? Colors.blue[600]
-                                : Colors.grey[100],
-                            foregroundColor: !_isVoiceMode
-                                ? Colors.white
-                                : Colors.grey[700],
-                            padding: const EdgeInsets.symmetric(vertical: 20),
+                            backgroundColor: Colors.blue[600],
+                            padding: const EdgeInsets.symmetric(vertical: 8),
                             shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
+                              borderRadius: BorderRadius.circular(10),
                             ),
                           ),
                           child: const Text(
-                            '채팅 상담',
-                            style: TextStyle(fontSize: 16),
+                            '상담종료',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                            ),
                           ),
                         ),
                       ),
                     ],
                   ),
+                  const SizedBox(height: 6),
 
-                  // 텍스트 입력 영역
-                  if (!_isVoiceMode)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 16),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _textController,
-                              enabled: !_isLoading,
-                              decoration: InputDecoration(
-                                hintText: '메시지를 입력하세요',
-                                filled: true,
-                                fillColor: Colors.grey[100],
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(12),
-                                  borderSide: BorderSide.none,
-                                ),
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 20,
-                                  vertical: 16,
-                                ),
-                              ),
-                              onSubmitted: (_) => _handleSendMessage(),
+                  // 텍스트 입력 영역 + 마이크 버튼 (3/4 크기)
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _textController,
+                          enabled: !_isLoading,
+                          maxLines: 1,
+                          style: const TextStyle(fontSize: 13),
+                          decoration: InputDecoration(
+                            hintText: '메시지 입력',
+                            hintStyle: const TextStyle(fontSize: 13),
+                            filled: true,
+                            fillColor: Colors.grey[100],
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(10),
+                              borderSide: BorderSide.none,
                             ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                            isDense: true,
                           ),
-                          const SizedBox(width: 12),
-                          ElevatedButton(
-                            onPressed: _isLoading ? null : _handleSendMessage,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.blue[600],
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 32,
-                                vertical: 20,
-                              ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                            ),
-                            child: const Text(
-                              '전송',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                              ),
-                            ),
-                          ),
-                        ],
+                          onSubmitted: (_) => _handleSendMessage(),
+                        ),
                       ),
-                    ),
+                      const SizedBox(width: 6),
+                      // 마이크 버튼 (3/4 크기)
+                      SizedBox(
+                        width: 36,
+                        height: 36,
+                        child: ElevatedButton(
+                          onPressed: _isLoading
+                              ? null
+                              : () {
+                                  if (_isRecording) {
+                                    _stopListening();
+                                  } else {
+                                    _startListening();
+                                  }
+                                },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _isRecording ? Colors.red[500] : Colors.orange[500],
+                            padding: EdgeInsets.zero,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                          child: Icon(
+                            _isRecording ? Icons.stop : Icons.mic,
+                            color: Colors.white,
+                            size: 18,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      // 전송 버튼 (3/4 크기)
+                      SizedBox(
+                        width: 36,
+                        height: 36,
+                        child: ElevatedButton(
+                          onPressed: _isLoading ? null : _handleSendMessage,
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue[600],
+                            padding: EdgeInsets.zero,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                          child: const Icon(
+                            Icons.send,
+                            color: Colors.white,
+                            size: 18,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 ],
               ),
             ),
